@@ -1,0 +1,354 @@
+const { Client, GatewayIntentBits, ChannelType, PermissionsBitField, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events } = require('discord.js');
+const express = require('express');
+const quickdb = require('quick.db');
+require('dotenv').config();
+
+// Configuración inicial
+const db = new quickdb.QuickDB();
+const client = new Client({
+  intents: Object.values(GatewayIntentBits),
+  presence: {
+    activities: [{
+      name: 'Tickets | !ayuda',
+      type: 3 // WATCHING
+    }]
+  }
+});
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Configuración por defecto
+const defaultSettings = {
+  staffRole: null,
+  ticketCategory: null,
+  logChannel: null,
+  welcomeChannel: null,
+  modRoles: []
+};
+
+// Sistema de Embeds
+const createEmbed = (title, description, color = 0x2F3136) => {
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(description)
+    .setColor(color)
+    .setTimestamp();
+};
+
+// Eventos principales
+client.on('ready', () => {
+  console.log(`✅ ${client.user.tag} listo en ${client.guilds.cache.size} servidores`);
+});
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot || !message.guild) return;
+  const prefix = '!';
+  const args = message.content.slice(prefix.length).trim().split(/ +/);
+  const command = args.shift().toLowerCase();
+
+  // Obtener configuración
+  const settings = await db.get(`config_${message.guild.id}`) || defaultSettings;
+
+  switch(command) {
+    case 'ayuda':
+      const helpEmbed = createEmbed('📚 Comandos disponibles', `
+      **Configuración**
+      !setstaff @rol - Establece rol de staff
+      !setcategory [ID/Nombre] - Establece categoría para tickets
+      !setlogs #canal - Establece canal de logs
+      
+      **Tickets**
+      !ticket - Crea un nuevo ticket
+      !close - Cierra el ticket actual
+      
+      **Moderación**
+      !kick @usuario [razón] - Expulsa un usuario
+      !ban @usuario [razón] - Banea un usuario
+      !warn @usuario [razón] - Advierte a un usuario
+      
+      **Utilidad**
+      !userinfo @usuario - Muestra información de un usuario
+      !serverinfo - Muestra información del servidor
+      `).setThumbnail(client.user.displayAvatarURL());
+      
+      const buttons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setLabel('Soporte')
+          .setURL('https://discord.gg/tu-invite')
+          .setStyle(ButtonStyle.Link),
+        new ButtonBuilder()
+          .setLabel('Invitar')
+          .setURL('https://discord.com/api/oauth2/authorize?client_id=TU_ID&permissions=8&scope=bot')
+          .setStyle(ButtonStyle.Link)
+      );
+      
+      message.reply({ embeds: [helpEmbed], components: [buttons] });
+      break;
+
+    case 'setstaff':
+      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        return message.reply({ embeds: [createEmbed('❌ Error', 'Necesitas permisos de administrador!', 0xFF0000)] });
+      }
+      
+      const role = message.mentions.roles.first();
+      if (!role) return message.reply({ embeds: [createEmbed('❌ Error', 'Menciona un rol válido!', 0xFF0000)] });
+      
+      await db.set(`config_${message.guild.id}.staffRole`, role.id);
+      message.reply({ embeds: [createEmbed('✅ Éxito', `Rol de staff establecido: ${role.name}`, 0x00FF00)] });
+      break;
+
+    case 'setcategory':
+      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        return message.reply({ embeds: [createEmbed('❌ Error', 'Necesitas permisos de administrador!', 0xFF0000)] });
+      }
+
+      const categoryArg = args.join(' ');
+      if (!categoryArg) return message.reply({ embeds: [createEmbed('❌ Error', 'Debes proporcionar un **nombre** o **ID** de categoría.', 0xFF0000)] });
+
+      const category = message.guild.channels.cache.find(
+        c => (c.id === categoryArg || c.name.toLowerCase() === categoryArg.toLowerCase()) && c.type === ChannelType.GuildCategory
+      );
+
+      if (category) {
+        await db.set(`config_${message.guild.id}.ticketCategory`, category.id);
+        message.reply({ embeds: [createEmbed('✅ Éxito', `Categoría configurada: ${category.name}`, 0x00FF00)] });
+      } else {
+        try {
+          const newCategory = await message.guild.channels.create({
+            name: categoryArg,
+            type: ChannelType.GuildCategory,
+            permissionOverwrites: [
+              { id: message.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] }
+            ]
+          });
+          
+          await db.set(`config_${message.guild.id}.ticketCategory`, newCategory.id);
+          message.reply({ embeds: [createEmbed('✅ Éxito', `Categoría creada: ${newCategory.name}`, 0x00FF00)] });
+        } catch (error) {
+          message.reply({ embeds: [createEmbed('❌ Error', `No pude crear la categoría: ${error.message}`, 0xFF0000)] });
+        }
+      }
+      break;
+
+    case 'setlogs':
+      if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        return message.reply({ embeds: [createEmbed('❌ Error', 'Necesitas permisos de administrador!', 0xFF0000)] });
+      }
+      
+      const channel = message.mentions.channels.first();
+      if (!channel) return message.reply({ embeds: [createEmbed('❌ Error', 'Menciona un canal válido!', 0xFF0000)] });
+      
+      await db.set(`config_${message.guild.id}.logChannel`, channel.id);
+      message.reply({ embeds: [createEmbed('✅ Éxito', `Canal de logs establecido: ${channel.name}`, 0x00FF00)] });
+      break;
+
+    case 'ticket':
+      const ticketEmbed = createEmbed('🎫 Soporte', 'Haz clic en el botón para crear un ticket!');
+      const ticketButton = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('create_ticket')
+          .setLabel('Crear Ticket')
+          .setStyle(ButtonStyle.Primary)
+          .setEmoji('📩')
+      );
+      
+      message.channel.send({ embeds: [ticketEmbed], components: [ticketButton] });
+      break;
+
+    case 'kick':
+      if (!message.member.permissions.has(PermissionsBitField.Flags.KickMembers)) {
+        return message.reply({ embeds: [createEmbed('❌ Error', 'No tienes permisos para expulsar miembros!', 0xFF0000)] });
+      }
+      
+      const memberToKick = message.mentions.members.first();
+      if (!memberToKick) return message.reply({ embeds: [createEmbed('❌ Error', 'Menciona un usuario válido!', 0xFF0000)] });
+      
+      const reason = args.slice(1).join(' ') || 'Sin razón especificada';
+      
+      try {
+        await memberToKick.kick(reason);
+        message.reply({ embeds: [createEmbed('✅ Éxito', `${memberToKick.user.tag} fue expulsado.\n**Razón:** ${reason}`, 0x00FF00)] });
+      } catch (error) {
+        message.reply({ embeds: [createEmbed('❌ Error', `No pude expulsar al usuario: ${error.message}`, 0xFF0000)] });
+      }
+      break;
+
+    case 'ban':
+      if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers)) {
+        return message.reply({ embeds: [createEmbed('❌ Error', 'No tienes permisos para banear miembros!', 0xFF0000)] });
+      }
+      
+      const memberToBan = message.mentions.members.first();
+      if (!memberToBan) return message.reply({ embeds: [createEmbed('❌ Error', 'Menciona un usuario válido!', 0xFF0000)] });
+      
+      const banReason = args.slice(1).join(' ') || 'Sin razón especificada';
+      
+      try {
+        await memberToBan.ban({ reason: banReason });
+        message.reply({ embeds: [createEmbed('✅ Éxito', `${memberToBan.user.tag} fue baneado.\n**Razón:** ${banReason}`, 0x00FF00)] });
+      } catch (error) {
+        message.reply({ embeds: [createEmbed('❌ Error', `No pude banear al usuario: ${error.message}`, 0xFF0000)] });
+      }
+      break;
+
+    case 'userinfo':
+      const targetUser = message.mentions.users.first() || message.author;
+      const memberInfo = message.guild.members.cache.get(targetUser.id);
+      
+      const userEmbed = createEmbed('👤 Información de Usuario', `
+        **Nombre:** ${targetUser.tag}
+        **ID:** ${targetUser.id}
+        **Cuenta creada:** <t:${Math.floor(targetUser.createdTimestamp / 1000)}:R>
+        **Se unió al servidor:** <t:${Math.floor(memberInfo.joinedTimestamp / 1000)}:R>
+        **Roles:** ${memberInfo.roles.cache.size - 1}
+      `).setThumbnail(targetUser.displayAvatarURL());
+      
+      message.reply({ embeds: [userEmbed] });
+      break;
+
+    case 'serverinfo':
+      const serverEmbed = createEmbed('🏰 Información del Servidor', `
+        **Nombre:** ${message.guild.name}
+        **Dueño:** <@${message.guild.ownerId}>
+        **Miembros:** ${message.guild.memberCount}
+        **Canales:** ${message.guild.channels.cache.size}
+        **Creado el:** <t:${Math.floor(message.guild.createdTimestamp / 1000)}:R>
+      `).setThumbnail(message.guild.iconURL());
+      
+      message.reply({ embeds: [serverEmbed] });
+      break;
+
+    case 'config':
+      const config = await db.get(`config_${message.guild.id}`) || defaultSettings;
+      const configEmbed = createEmbed('⚙️ Configuración actual', `
+        **Rol de Staff:** ${config.staffRole ? `<@&${config.staffRole}>` : "No configurado"}
+        **Categoría de Tickets:** ${config.ticketCategory ? `<#${config.ticketCategory}>` : "No configurado"}
+        **Canal de Logs:** ${config.logChannel ? `<#${config.logChannel}>` : "No configurado"}
+      `);
+      message.reply({ embeds: [configEmbed] });
+      break;
+  }
+});
+
+// Sistema de Tickets con Botones
+client.on(Events.InteractionCreate, async interaction => {
+  if (!interaction.isButton()) return;
+  
+  if (interaction.customId === 'create_ticket') {
+    const settings = await db.get(`config_${interaction.guild.id}`) || defaultSettings;
+    
+    const existingTicket = interaction.guild.channels.cache.find(
+      ch => ch.name === `ticket-${interaction.user.id}`
+    );
+    
+    if (existingTicket) {
+      return interaction.reply({ 
+        embeds: [createEmbed('❌ Error', `Ya tienes un ticket abierto: ${existingTicket}`, 0xFF0000)],
+        ephemeral: true 
+      });
+    }
+    
+    const category = interaction.guild.channels.cache.get(settings.ticketCategory);
+    const ticketChannel = await interaction.guild.channels.create({
+      name: `ticket-${interaction.user.id}`,
+      type: ChannelType.GuildText,
+      parent: category?.id,
+      permissionOverwrites: [
+        { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+        { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
+        { id: settings.staffRole, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] }
+      ]
+    });
+    
+    const embed = createEmbed('🎫 Ticket Creado', `
+      ${interaction.user}, el staff te atenderá pronto.
+      **Comandos útiles:**
+      - \`!close\` - Cierra el ticket
+      - \`!add @usuario\` - Añade un usuario al ticket
+    `).setColor(0x00FF00);
+    
+    const closeButton = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('close_ticket')
+        .setLabel('Cerrar Ticket')
+        .setStyle(ButtonStyle.Danger)
+        .setEmoji('🔒')
+    );
+    
+    ticketChannel.send({ 
+      content: `${interaction.user} <@&${settings.staffRole}>`,
+      embeds: [embed], 
+      components: [closeButton] 
+    });
+    
+    interaction.reply({
+      embeds: [createEmbed('✅ Éxito', `Ticket creado: ${ticketChannel}`, 0x00FF00)],
+      ephemeral: true
+    });
+  }
+  
+  if (interaction.customId === 'close_ticket') {
+    if (!interaction.channel.name.startsWith('ticket-')) return;
+    
+    const embed = createEmbed('🔒 Cerrando Ticket', 'El ticket se cerrará en 10 segundos...', 0xFFA500);
+    const confirmButton = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('confirm_close')
+        .setLabel('Confirmar Cierre')
+        .setStyle(ButtonStyle.Danger)
+    );
+    
+    interaction.reply({ embeds: [embed], components: [confirmButton] });
+  }
+  
+  if (interaction.customId === 'confirm_close') {
+    await interaction.channel.delete();
+  }
+});
+
+// Sistema de Logs
+client.on(Events.GuildMemberAdd, async member => {
+  const settings = await db.get(`config_${member.guild.id}`) || defaultSettings;
+  if (!settings.logChannel) return;
+  
+  const embed = createEmbed('👋 Nuevo Miembro', `
+    **Usuario:** ${member.user.tag} (${member.id})
+    **Cuenta creada:** <t:${Math.floor(member.user.createdTimestamp / 1000)}:R>
+  `).setThumbnail(member.user.displayAvatarURL())
+    .setColor(0x00FF00);
+  
+  client.channels.cache.get(settings.logChannel).send({ embeds: [embed] });
+});
+
+client.on(Events.MessageDelete, async message => {
+  if (message.author.bot) return;
+  const settings = await db.get(`config_${message.guild.id}`) || defaultSettings;
+  
+  const embed = createEmbed('🗑️ Mensaje Eliminado', `
+    **Autor:** ${message.author.tag}
+    **Canal:** ${message.channel.name}
+    **Contenido:** ${message.content || 'N/A'}
+  `).setColor(0xFF0000);
+  
+  client.channels.cache.get(settings.logChannel)?.send({ embeds: [embed] });
+});
+
+// Sistema de Bienvenida
+client.on(Events.GuildMemberAdd, async member => {
+  const settings = await db.get(`config_${member.guild.id}`) || defaultSettings;
+  if (!settings.welcomeChannel) return;
+  
+  const embed = createEmbed(`🎉 Bienvenido a ${member.guild.name}!`, `
+    ${member.user}, gracias por unirte!
+    **Miembros:** ${member.guild.memberCount}
+  `).setThumbnail(member.user.displayAvatarURL())
+    .setImage('https://i.imgur.com/kybjEU1.png');
+  
+  client.channels.cache.get(settings.welcomeChannel).send({
+    content: `${member.user}`,
+    embeds: [embed]
+  });
+});
+
+client.login('TOKEN');
